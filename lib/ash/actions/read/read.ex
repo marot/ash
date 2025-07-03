@@ -357,7 +357,6 @@ defmodule Ash.Actions.Read do
                  opts[:tracer],
                  opts[:authorize?]
                ),
-             # TODO: we access new_query here because it might have new loads to load.
              {:ok, data} <-
                load_relationships(data, new_query, opts),
              {:ok, data} <-
