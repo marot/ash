@@ -357,8 +357,9 @@ defmodule Ash.Actions.Read do
                  opts[:tracer],
                  opts[:authorize?]
                ),
+             # TODO: we access new_query here because it might have new loads to load.
              {:ok, data} <-
-               load_relationships(data, query, opts),
+               load_relationships(data, new_query, opts),
              {:ok, data} <-
                Ash.Actions.Read.Calculations.run(
                  data,
@@ -548,19 +549,6 @@ defmodule Ash.Actions.Read do
                  agg_refs(query, data_layer_calculations ++ [{nil, query.filter}]),
                  opts[:authorize?]
                ),
-             data_layer_calculations <-
-               authorize_calculation_expressions(
-                 data_layer_calculations,
-                 query.resource,
-                 opts[:authorize?],
-                 relationship_path_filters,
-                 opts[:actor],
-                 query.tenant,
-                 opts[:tracer],
-                 query.domain,
-                 parent_stack_from_context(query.context),
-                 query.context
-               ),
              query <-
                authorize_loaded_aggregates(
                  query,
@@ -619,8 +607,32 @@ defmodule Ash.Actions.Read do
                  query.context
                ),
              query <- Map.put(query, :filter, filter),
+             original_query = query,
              query <- Ash.Query.unset(query, :calculations),
              {%{valid?: true} = query, before_notifications} <- run_before_action(query),
+             {calculations_in_query, calculations_at_runtime, query} <-
+               process_new_calculations_after_before_action(
+                 calculations_in_query,
+                 calculations_at_runtime,
+                 original_query,
+                 query,
+                 opts
+               ),
+             {:ok, updated_data_layer_calculations} <-
+               hydrate_calculations(query, calculations_in_query),
+             updated_data_layer_calculations <-
+               authorize_calculation_expressions(
+                 updated_data_layer_calculations,
+                 query.resource,
+                 opts[:authorize?],
+                 relationship_path_filters,
+                 opts[:actor],
+                 query.tenant,
+                 opts[:tracer],
+                 query.domain,
+                 parent_stack_from_context(query.context),
+                 query.context
+               ),
              {:ok, count} <-
                fetch_count(
                  query,
@@ -632,7 +644,9 @@ defmodule Ash.Actions.Read do
              {:ok, query} <- paginate(query, action, opts[:skip_pagination?]),
              :ok <- validate_combinations(query, calculations_at_runtime, query.load),
              {:ok, data_layer_query} <-
-               Ash.Query.data_layer_query(query, data_layer_calculations: data_layer_calculations),
+               Ash.Query.data_layer_query(query,
+                 data_layer_calculations: updated_data_layer_calculations
+               ),
              {{:ok, results}, query} <-
                run_query(
                  set_phase(query, :executing),
@@ -769,19 +783,6 @@ defmodule Ash.Actions.Read do
              agg_refs(query, data_layer_calculations ++ [{nil, query.filter}]),
              opts[:authorize?]
            ),
-         data_layer_calculations <-
-           authorize_calculation_expressions(
-             data_layer_calculations,
-             query.resource,
-             opts[:authorize?],
-             relationship_path_filters,
-             opts[:actor],
-             query.tenant,
-             opts[:tracer],
-             query.domain,
-             parent_stack_from_context(query.context),
-             query.context
-           ),
          query <-
            authorize_loaded_aggregates(
              query,
@@ -840,8 +841,32 @@ defmodule Ash.Actions.Read do
              query.context
            ),
          query <- Map.put(query, :filter, filter),
+         original_query = query,
          query <- Ash.Query.unset(query, :calculations),
          {%{valid?: true} = query, before_notifications} <- run_before_action(query),
+         {calculations_in_query, calculations_at_runtime, query} <-
+           process_new_calculations_after_before_action(
+             calculations_in_query,
+             calculations_at_runtime,
+             original_query,
+             query,
+             opts
+           ),
+         {:ok, updated_data_layer_calculations} <-
+           hydrate_calculations(query, calculations_in_query),
+         updated_data_layer_calculations <-
+           authorize_calculation_expressions(
+             updated_data_layer_calculations,
+             query.resource,
+             opts[:authorize?],
+             relationship_path_filters,
+             opts[:actor],
+             query.tenant,
+             opts[:tracer],
+             query.domain,
+             parent_stack_from_context(query.context),
+             query.context
+           ),
          {:ok, count} <-
            fetch_count(
              query,
@@ -853,7 +878,9 @@ defmodule Ash.Actions.Read do
          {:ok, query} <- paginate(query, action, opts[:skip_pagination?]),
          :ok <- validate_combinations(query, calculations_at_runtime, query.load),
          {:ok, data_layer_query} <-
-           Ash.Query.data_layer_query(query, data_layer_calculations: data_layer_calculations) do
+           Ash.Query.data_layer_query(query,
+             data_layer_calculations: updated_data_layer_calculations
+           ) do
       {:ok,
        %{
          query: data_layer_query,
@@ -3338,6 +3365,69 @@ defmodule Ash.Actions.Read do
       end
     end)
     |> then(fn {query, notifications} -> {set_phase(query), notifications} end)
+  end
+
+  defp process_new_calculations_after_before_action(
+         calculations_in_query,
+         calculations_at_runtime,
+         original_query,
+         query,
+         opts
+       ) do
+    new_calculations =
+      query.calculations
+      |> Map.reject(fn {name, _calculation} ->
+        Map.has_key?(original_query.calculations, name)
+      end)
+
+    new_loads =
+      query.load
+      |> Enum.reject(fn {name, _load_query} ->
+        Keyword.has_key?(original_query.load, name)
+      end)
+
+    if Enum.empty?(new_calculations) and Enum.empty?(new_loads) do
+      {calculations_in_query, calculations_at_runtime, query}
+    else
+      updated_query = query
+
+      {updated_calculations_in_query, updated_calculations_at_runtime, updated_query} =
+        if Enum.empty?(new_calculations) do
+          {calculations_in_query, calculations_at_runtime, updated_query}
+        else
+          temp_query = %{updated_query | calculations: new_calculations}
+
+          pkey = Ash.Resource.Info.primary_key(updated_query.resource)
+          missing_pkeys? = Enum.empty?(pkey)
+          # Since this is after before_action, we don't reuse values
+          reuse_values? = false
+
+          {new_calculations_in_query, new_calculations_at_runtime, calc_updated_query} =
+            Ash.Actions.Read.Calculations.split_and_load_calculations(
+              updated_query.domain,
+              temp_query,
+              missing_pkeys?,
+              # No initial data for new calculations
+              :error,
+              reuse_values?,
+              opts[:authorize?]
+            )
+
+          merged_calculations_in_query = calculations_in_query ++ new_calculations_in_query
+          merged_calculations_at_runtime = calculations_at_runtime ++ new_calculations_at_runtime
+
+          final_query = %{
+            updated_query
+            | calculations:
+                Map.merge(updated_query.calculations, calc_updated_query.calculations),
+              context: Map.merge(updated_query.context, calc_updated_query.context)
+          }
+
+          {merged_calculations_in_query, merged_calculations_at_runtime, final_query}
+        end
+
+      {updated_calculations_in_query, updated_calculations_at_runtime, updated_query}
+    end
   end
 
   @doc false
