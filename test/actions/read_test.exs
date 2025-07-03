@@ -5,6 +5,7 @@ defmodule Ash.Test.Actions.ReadTest do
   import Ash.Test
 
   require Ash.Query
+  import Ash.Expr
 
   alias Ash.Test.Domain, as: Domain
   require Ash.Flags
@@ -243,6 +244,7 @@ defmodule Ash.Test.Actions.ReadTest do
       fetched_post = Ash.get!(Post, post.id, action: :read_with_calculation_before_action)
       assert "test - yeet" = fetched_post.calculations.title_and_contents
     end
+
   end
 
   describe "Ash.get!/3" do
